@@ -1,0 +1,7 @@
+# Procfile tells a host like Heroku/Railway HOW to start this app.
+# There is no file extension — the filename is just "Procfile".
+#
+# "web"  = this process handles HTTP traffic
+# gunicorn = production server (listed in requirements.txt)
+# app:app  = look in app.py for a Flask object named "app"
+web: gunicorn app:app
