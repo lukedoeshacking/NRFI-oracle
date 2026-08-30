@@ -1,0 +1,16 @@
+This is "NRFI Oracle" — an MLB NRFI/YRFI prediction web app.
+
+Stack:
+- Backend: Python Flask hosted on Railway
+- Database: PostgreSQL hosted on Supabase (psycopg2)
+- ML Model: XGBoost classifier saved as nrfi_model.pkl
+- Frontend: Next.js + Tailwind CSS hosted on Vercel
+- Data sources: pybaseball library + MLB Stats API (free, no key needed)
+
+Rules:
+- Always use environment variables for credentials, never hardcode them
+- Use python-dotenv to load .env in all Python scripts
+- Keep code simple and well-commented — the developer is learning to code
+- All Python scripts should print progress updates as they run
+- Flask API must use flask-cors so Vercel frontend can call it
+- Always handle errors gracefully and print helpful error messages
