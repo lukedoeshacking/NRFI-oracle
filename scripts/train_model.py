@@ -101,16 +101,16 @@ def fetch_training_rows():
         FROM games g
         JOIN pitchers hp
             ON hp.name = g.home_pitcher
-           AND hp.season = g.season
+           AND hp.season = EXTRACT(YEAR FROM g.game_date)
         JOIN pitchers ap
             ON ap.name = g.away_pitcher
-           AND ap.season = g.season
+           AND ap.season = EXTRACT(YEAR FROM g.game_date)
         JOIN teams ht
-            ON ht.name = g.home_team
-           AND ht.season = g.season
+            ON ht.team = g.home_team
+           AND ht.season = EXTRACT(YEAR FROM g.game_date)
         JOIN teams at
-            ON at.name = g.away_team
-           AND at.season = g.season
+            ON at.team = g.away_team
+           AND at.season = EXTRACT(YEAR FROM g.game_date)
         WHERE g.nrfi IS NOT NULL
           AND COALESCE(g.completed, TRUE) = TRUE
     """
