@@ -12,4 +12,4 @@ requests           # Makes HTTP requests to other APIs
 python-dotenv      # Loads secret config (like DATABASE_URL) from a .env file
 joblib             # Save/load trained ML models to disk
 gunicorn           # Production web server that runs the Flask app
-pybaseball         # Pulls historical MLB stats (used by scripts/pull_historical.py)
+# pybaseball removed — pull_historical.py now uses only the MLB Stats API

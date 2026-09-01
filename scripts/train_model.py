@@ -77,8 +77,8 @@ def fetch_training_rows():
     """
     print("Loading completed games joined with pitcher and team stats...")
 
-    # COALESCE(completed, TRUE) treats a missing completed flag as "yes".
     # nrfi IS NOT NULL means we already know the 1st-inning outcome.
+    # All rows in the games table are completed games, so no extra filter needed.
     query = """
         SELECT
             hp.era              AS home_pitcher_era,
@@ -99,20 +99,19 @@ def fetch_training_rows():
             -- PostgreSQL booleans become True/False; we turn them into 1/0 below
             g.nrfi AS nrfi
         FROM games g
-        JOIN pitchers hp
+        LEFT JOIN pitchers hp
             ON hp.name = g.home_pitcher
            AND hp.season = EXTRACT(YEAR FROM g.game_date)
-        JOIN pitchers ap
+        LEFT JOIN pitchers ap
             ON ap.name = g.away_pitcher
            AND ap.season = EXTRACT(YEAR FROM g.game_date)
-        JOIN teams ht
+        LEFT JOIN teams ht
             ON ht.team = g.home_team
            AND ht.season = EXTRACT(YEAR FROM g.game_date)
-        JOIN teams at
+        LEFT JOIN teams at
             ON at.team = g.away_team
            AND at.season = EXTRACT(YEAR FROM g.game_date)
         WHERE g.nrfi IS NOT NULL
-          AND COALESCE(g.completed, TRUE) = TRUE
     """
 
     rows = execute_query(query)
@@ -135,13 +134,28 @@ def build_xy(rows):
             "and check that games join to pitchers/teams on name + season."
         )
 
-    # Drop rows where any feature is missing (XGBoost can handle NaN, but
-    # a clean table is easier to debug while you are learning).
-    df = df.dropna(subset=FEATURE_COLUMNS + ["nrfi"])
-    print(f"Using {len(df)} rows after dropping missing values.")
+    # Fill missing stats with league-average fallbacks so every game is usable.
+    # LEFT JOINs mean some rows have NULLs where pitcher/team stats didn't match;
+    # these defaults keep those games in the training set instead of discarding them.
+    LEAGUE_AVERAGES = {
+        "home_pitcher_era":    4.50,
+        "home_pitcher_fi_era": 4.95,
+        "home_pitcher_whip":   1.30,
+        "home_pitcher_k_per_9": 8.5,
+        "home_pitcher_bb_per_9": 3.2,
+        "away_pitcher_era":    4.50,
+        "away_pitcher_fi_era": 4.95,
+        "away_pitcher_whip":   1.30,
+        "away_pitcher_k_per_9": 8.5,
+        "away_pitcher_bb_per_9": 3.2,
+        "home_team_fi_rate":   0.28,
+        "away_team_fi_rate":   0.28,
+    }
+    df = df.fillna(LEAGUE_AVERAGES)
 
-    if len(df) == 0:
-        raise ValueError("Every row had missing features. Check pitcher/team joins.")
+    # Only drop rows where the label itself is unknown — we need nrfi to train.
+    df = df.dropna(subset=["nrfi"])
+    print(f"Using {len(df)} rows after applying league-average fallbacks.")
 
     X = df[FEATURE_COLUMNS].astype(float)
 
