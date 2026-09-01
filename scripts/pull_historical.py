@@ -122,6 +122,11 @@ def pull_pitchers(season):
                      &sportId=1&season=YEAR&group=pitching
     """
     print(f"\n=== Pitchers {season} ===")
+
+    # Remove any existing rows for this season so re-running never duplicates data.
+    execute_query("DELETE FROM pitchers WHERE season = %s", (season,))
+    print(f"  Cleared existing pitcher rows for {season}.")
+
     url = f"{MLB_STATS_BASE}/stats"
     payload = fetch_json(
         url,
@@ -132,6 +137,9 @@ def pull_pitchers(season):
             "sportId": 1,           # 1 = MLB
             "season": season,
             "group": "pitching",
+            # The API defaults to 100 rows — raise the cap so we get all ~500+
+            # pitchers, not just the first 100 alphabetically.
+            "limit": 1000,
         },
     )
 
