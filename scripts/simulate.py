@@ -97,17 +97,40 @@ def get_lineup(game_date_str, team_name):
 
 def get_batter_stats(player_name):
     """
-    Look up a batter's OBP and SLG from the batters table (most recent season).
+    Return {"obp": float, "slg": float} for a batter, checking three sources
+    in priority order:
 
-    The lineups table may prefix projected players with "[PROJ] " — we strip
-    that prefix before searching so names match what's in the batters table.
+      1. batter_recent_form table  — blended stats (65% last-30-days + 35% season)
+         populated by pull_recent_form.py each morning
+      2. batters table             — full-season average
+      3. League-average fallback
 
-    Returns a dict {"obp": float, "slg": float}.
-    Falls back to league averages when the batter is not found.
+    Falls back to the next source automatically if a table is missing or the
+    batter is not found.
     """
-    # Strip the [PROJ] tag that pull_lineups.py adds to projected lineups
     clean_name = player_name.replace("[PROJ] ", "").strip()
 
+    # --- 1. Blended recent-form stats (most up-to-date) ---
+    try:
+        rows = execute_query(
+            """
+            SELECT blended_obp, blended_slg
+            FROM   batter_recent_form
+            WHERE  name = %s AND as_of_date = CURRENT_DATE
+            ORDER  BY id DESC
+            LIMIT  1
+            """,
+            (clean_name,),
+        )
+        if rows and rows[0].get("blended_obp") is not None:
+            return {
+                "obp": float(rows[0]["blended_obp"]),
+                "slg": float(rows[0]["blended_slg"] or LEAGUE_AVG_SLG),
+            }
+    except Exception:
+        pass   # table might not exist yet — continue to next source
+
+    # --- 2. Season stats from the batters table ---
     try:
         rows = execute_query(
             """
@@ -127,22 +150,43 @@ def get_batter_stats(player_name):
     except Exception as error:
         print(f"    DB error fetching stats for '{clean_name}': {error}")
 
-    # Batter not in DB — fall back to league averages
+    # --- 3. League-average fallback ---
     print(f"    '{clean_name}' not in batters table — using league-avg OBP/SLG")
     return {"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}
 
 
 def get_pitcher_stats(pitcher_name, game):
     """
-    Fetch a pitcher's WHIP and K/9 from the pitchers table (most recent season).
+    Return (whip, k_per_9) for a pitcher, checking four sources in order:
 
-    If the pitcher is not in the table, we fall back to the stats that
-    pull_daily.py already embedded in today_games.json (the 'game' dict),
-    and finally to league-average values if those are also missing.
+      1. pitcher_recent_form table — blended stats (65% last-5-starts + 35% season)
+         populated by pull_recent_form.py each morning
+      2. pitchers table            — full-season average
+      3. today_games.json values   — stats embedded by pull_daily.py
+      4. League-average fallback
 
-    Returns a tuple: (whip, k_per_9)
+    Falls back to the next source automatically at each step.
     """
     if pitcher_name and pitcher_name != "TBD":
+
+        # --- 1. Blended recent-form stats (most up-to-date) ---
+        try:
+            rows = execute_query(
+                """
+                SELECT blended_whip, blended_k_per_9
+                FROM   pitcher_recent_form
+                WHERE  name = %s AND as_of_date = CURRENT_DATE
+                ORDER  BY id DESC
+                LIMIT  1
+                """,
+                (pitcher_name,),
+            )
+            if rows and rows[0].get("blended_whip") is not None:
+                return float(rows[0]["blended_whip"]), float(rows[0]["blended_k_per_9"])
+        except Exception:
+            pass   # table might not exist yet — continue to next source
+
+        # --- 2. Season stats from the pitchers table ---
         try:
             rows = execute_query(
                 """
@@ -155,15 +199,15 @@ def get_pitcher_stats(pitcher_name, game):
                 (pitcher_name,),
             )
             if rows:
-                whip  = rows[0].get("whip")
+                whip    = rows[0].get("whip")
                 k_per_9 = rows[0].get("k_per_9")
                 if whip is not None and k_per_9 is not None:
                     return float(whip), float(k_per_9)
         except Exception as error:
             print(f"    DB error fetching stats for '{pitcher_name}': {error}")
 
-    # Fall back to the stats already embedded in today_games.json by pull_daily.py
-    whip  = game.get("home_pitcher_whip")  or LEAGUE_AVG_WHIP
+    # --- 3. Stats embedded in today_games.json by pull_daily.py ---
+    whip    = game.get("home_pitcher_whip")    or LEAGUE_AVG_WHIP
     k_per_9 = game.get("home_pitcher_k_per_9") or LEAGUE_AVG_K9
     return float(whip), float(k_per_9)
 
