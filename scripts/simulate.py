@@ -155,7 +155,7 @@ def get_batter_stats(player_name):
     return {"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}
 
 
-def get_pitcher_stats(pitcher_name, game):
+def get_pitcher_stats(pitcher_name, game, side="home"):
     """
     Return (whip, k_per_9) for a pitcher, checking four sources in order:
 
@@ -166,6 +166,9 @@ def get_pitcher_stats(pitcher_name, game):
       4. League-average fallback
 
     Falls back to the next source automatically at each step.
+
+    side : "home" or "away" — controls which fallback key is read from the
+           game dict (e.g. "home_pitcher_whip" vs "away_pitcher_whip").
     """
     if pitcher_name and pitcher_name != "TBD":
 
@@ -207,8 +210,9 @@ def get_pitcher_stats(pitcher_name, game):
             print(f"    DB error fetching stats for '{pitcher_name}': {error}")
 
     # --- 3. Stats embedded in today_games.json by pull_daily.py ---
-    whip    = game.get("home_pitcher_whip")    or LEAGUE_AVG_WHIP
-    k_per_9 = game.get("home_pitcher_k_per_9") or LEAGUE_AVG_K9
+    # Use the correct side prefix so home and away pitchers get their own values.
+    whip    = game.get(f"{side}_pitcher_whip")    or LEAGUE_AVG_WHIP
+    k_per_9 = game.get(f"{side}_pitcher_k_per_9") or LEAGUE_AVG_K9
     return float(whip), float(k_per_9)
 
 
@@ -254,29 +258,33 @@ def on_base_event_type(obp, slg):
     Given that a batter has already reached base, decide HOW they got on:
     'walk', 'single', or 'double'.
 
-    Base split (league average):
-        10% walks  — advance runners only if forced
-        70% singles — all runners advance 1 base; runner on 2nd or 3rd scores
-        20% doubles — all runners score; batter ends on 2nd
+    Fractions are calibrated to real 2024 MLB averages:
 
-    The double fraction is scaled by the batter's power relative to the
-    league average (SLG/OBP ratio).  A slugger gets more doubles; a
-    slap hitter gets more singles.
+      Walk  ≈ 27%   BB/PA (8.5%) divided by OBP (31.5%)
+      Double≈ 14%   2B/PA (4.4%) divided by OBP (31.5%)
+      Single≈ 59%   remaining hits (triples/HRs are rare, folded into singles
+                    for simplicity — this slightly over-counts singles but
+                    avoids the complexity of simulating HR separately)
+
+    The double fraction is further scaled by the batter's power (SLG/OBP)
+    relative to the league average, so sluggers get proportionally more
+    doubles and contact hitters get more singles.
 
     Example — power hitter (SLG=0.520, OBP=0.380):
         power_ratio = (0.520/0.380) / 1.28 = 1.07
-        double_rate ≈ 21%  (slightly above average)
+        double_rate ≈ 15%  (slightly above average)
 
     Example — contact hitter (SLG=0.340, OBP=0.350):
         power_ratio = (0.340/0.350) / 1.28 = 0.76
-        double_rate ≈ 15%  (below average)
+        double_rate ≈ 11%  (below average)
     """
-    walk_rate = 0.10   # fixed fraction — roughly matches MLB walk/OBP ratio
+    # ~27% of all OBP events are walks — calibrated to real MLB BB/OBP ratio
+    walk_rate = 0.27
 
-    # Scale the double rate by the batter's power (SLG relative to OBP).
-    # Cap between 5% and 40% so extreme inputs stay sensible.
+    # Base double rate ~14%; scale by batter's power relative to league avg.
+    # Cap between 5% and 35% so extreme inputs stay sensible.
     power_ratio = (slg / max(obp, 0.001)) / LEAGUE_SLG_PER_OBP
-    double_rate = min(max(0.20 * power_ratio, 0.05), 0.40)
+    double_rate = min(max(0.14 * power_ratio, 0.05), 0.35)
 
     # Singles fill whatever fraction is left after walks and doubles.
     # single_rate = 1 - walk_rate - double_rate (implicit from the thresholds below)
@@ -322,13 +330,20 @@ def apply_walk(bases):
 def apply_single(bases):
     """
     All runners advance 1 base.
-    Runners on 2nd or 3rd score; runner on 1st moves to 2nd; batter takes 1st.
+
+    Scoring rules (calibrated to real MLB):
+      Runner on 3rd  → scores virtually every time (100%)
+      Runner on 2nd  → scores ~45% of the time on a single
+                       (depends on runner speed, hit direction, outfield depth)
+      Runner on 1st  → advances to 2nd; does NOT score
+      Batter         → takes 1st base
 
     bases : [bool, bool, bool]  — [1st, 2nd, 3rd]
     Returns (new_bases, run_scored).
     """
-    run_scored = bases[1] or bases[2]   # 2nd or 3rd runner scores
-    # After the single: old-1st → 2nd, batter → 1st, 2nd+3rd vacated (scored)
+    # Runner on 3rd always scores; runner on 2nd scores roughly half the time
+    run_scored = bases[2] or (bases[1] and random.random() < 0.45)
+    # After the single: old-1st → 2nd, batter → 1st, 2nd+3rd are now empty
     new_bases = [True, bases[0], False]
     return new_bases, run_scored
 
@@ -547,82 +562,96 @@ def main():
         home_pitcher = game.get("home_pitcher") or "TBD"
         away_pitcher = game.get("away_pitcher") or "TBD"
 
-        print(f"{away_team} @ {home_team}  |  Home pitcher: {home_pitcher}")
+        print(f"{away_team} @ {home_team}")
+        print(f"  TOP: {away_team} bat vs {home_pitcher}  |  BOT: {home_team} bat vs {away_pitcher}")
 
-        # ---- Step 2: Get the away team's lineup ----
-        # The away team bats in the top of the 1st inning, so we need their lineup
-        # facing the home pitcher.
-        lineup_names = get_lineup(today_str, away_team)
-
-        if not lineup_names:
+        # ---- Step 2a: Away lineup (top of 1st — away team bats vs home pitcher) ----
+        away_lineup = get_lineup(today_str, away_team)
+        if not away_lineup:
             print(f"  No lineup found for {away_team} — using 5 league-avg batters")
-            batters_stats = [{"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}] * 5
+            away_stats = [{"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}] * 5
         else:
-            preview = ", ".join(lineup_names[:3])
-            print(f"  Lineup: {preview}{'...' if len(lineup_names) > 3 else ''}")
+            preview = ", ".join(away_lineup[:3])
+            print(f"  {away_team} lineup: {preview}{'...' if len(away_lineup) > 3 else ''}")
+            away_stats = [get_batter_stats(name) for name in away_lineup]
+            while len(away_stats) < 5:
+                away_stats.append({"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG})
 
-            # Look up each batter's OBP and SLG from the batters table
-            batters_stats = [get_batter_stats(name) for name in lineup_names]
+        # ---- Step 2b: Home lineup (bottom of 1st — home team bats vs away pitcher) ----
+        home_lineup = get_lineup(today_str, home_team)
+        if not home_lineup:
+            print(f"  No lineup found for {home_team} — using 5 league-avg batters")
+            home_stats = [{"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}] * 5
+        else:
+            preview = ", ".join(home_lineup[:3])
+            print(f"  {home_team} lineup: {preview}{'...' if len(home_lineup) > 3 else ''}")
+            home_stats = [get_batter_stats(name) for name in home_lineup]
+            while len(home_stats) < 5:
+                home_stats.append({"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG})
 
-            # Pad to 5 slots with league averages if fewer batters were stored
-            while len(batters_stats) < 5:
-                batters_stats.append({"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG})
-
-        # ---- Step 3: Get the home pitcher's stats ----
-        whip, k_per_9 = get_pitcher_stats(home_pitcher, game)
-        quality       = calc_quality_factor(whip, k_per_9)
-        # Show the full quality-factor breakdown for every game so we can
-        # immediately spot if all pitchers are getting the same fallback stats.
-        whip_comp = whip / LEAGUE_AVG_WHIP
-        k_comp    = LEAGUE_AVG_K9 / max(k_per_9, 0.1)
+        # ---- Step 3a: Home pitcher stats (faces away batters in top half) ----
+        h_whip, h_k9 = get_pitcher_stats(home_pitcher, game, side="home")
+        h_quality     = calc_quality_factor(h_whip, h_k9)
+        h_whip_comp   = h_whip / LEAGUE_AVG_WHIP
+        h_k_comp      = LEAGUE_AVG_K9 / max(h_k9, 0.1)
         print(
-            f"  Pitcher stats → "
-            f"WHIP={whip:.2f} (component={whip_comp:.3f})  "
-            f"K/9={k_per_9:.1f} (component={k_comp:.3f})  "
-            f"quality_factor={quality:.3f}"
+            f"  [TOP] {home_pitcher}: "
+            f"WHIP={h_whip:.2f} (comp={h_whip_comp:.3f})  "
+            f"K/9={h_k9:.1f} (comp={h_k_comp:.3f})  "
+            f"quality={h_quality:.3f}"
         )
 
-        # ---- DEBUG: Print 3 sample simulations for the first game only ----
-        # This shows exactly what the math is doing so we can spot problems.
-        # It runs BEFORE the real 1,000-simulation loop and does not affect results.
+        # ---- Step 3b: Away pitcher stats (faces home batters in bottom half) ----
+        a_whip, a_k9 = get_pitcher_stats(away_pitcher, game, side="away")
+        a_quality     = calc_quality_factor(a_whip, a_k9)
+        a_whip_comp   = a_whip / LEAGUE_AVG_WHIP
+        a_k_comp      = LEAGUE_AVG_K9 / max(a_k9, 0.1)
+        print(
+            f"  [BOT] {away_pitcher}: "
+            f"WHIP={a_whip:.2f} (comp={a_whip_comp:.3f})  "
+            f"K/9={a_k9:.1f} (comp={a_k_comp:.3f})  "
+            f"quality={a_quality:.3f}"
+        )
+
+        # ---- DEBUG: 3 sample simulations for the first game (top half only) ----
         if game_idx == 0:
             print()
             print("  ══════════════════════════════════════════════════════════")
-            print(f"  DEBUG — 3 sample simulations for: {away_team} @ {home_team}")
+            print(f"  DEBUG — 3 sample TOP-half simulations for: {away_team} @ {home_team}")
             print()
-
-            # Show how the quality factor was calculated so we can verify it
-            whip_component = whip / LEAGUE_AVG_WHIP
-            k_component    = LEAGUE_AVG_K9 / max(k_per_9, 0.1)
-            print(f"  Quality factor breakdown:")
-            print(f"    WHIP component  = pitcher_whip / league_avg  = {whip:.2f} / {LEAGUE_AVG_WHIP} = {whip_component:.3f}")
-            print(f"    K/9  component  = league_avg / pitcher_k_per_9 = {LEAGUE_AVG_K9} / {k_per_9:.1f} = {k_component:.3f}")
-            print(f"    Average of both = ({whip_component:.3f} + {k_component:.3f}) / 2 = {quality:.3f}")
+            print(f"  Home pitcher quality factor breakdown:")
+            print(f"    WHIP: {h_whip:.2f}/{LEAGUE_AVG_WHIP} = {h_whip_comp:.3f}  |  K/9: {LEAGUE_AVG_K9}/{h_k9:.1f} = {h_k_comp:.3f}  |  avg = {h_quality:.3f}")
             print()
-
-            # Show the full batter stats table so we know what values are feeding in
-            print(f"  Batter OBP/SLG feeding into the simulation:")
-            names_for_debug = lineup_names if lineup_names else [f"Batter {i+1}" for i in range(5)]
-            for i, (name, stats) in enumerate(zip(names_for_debug, batters_stats), start=1):
-                eff = min(stats["obp"] * quality, 0.95)
+            print(f"  {away_team} batter OBP/SLG (top-half batters):")
+            names_debug = away_lineup if away_lineup else [f"Batter {i+1}" for i in range(5)]
+            for i, (name, stats) in enumerate(zip(names_debug, away_stats), start=1):
+                eff = min(stats["obp"] * h_quality, 0.95)
                 print(f"    #{i}  {name.replace('[PROJ] ', ''):<22s}  OBP={stats['obp']:.3f}  SLG={stats['slg']:.3f}  eff_OBP={eff:.3f}")
             print()
-
-            # Run 3 fully verbose sample simulations
-            # NOTE: random.seed() is NOT called here so these samples use the same
-            # random stream as the real simulations — no cherry-picking.
             for sample_num in range(1, 4):
-                debug_simulate_inning(batters_stats, quality, names_for_debug, sample_num)
-
+                debug_simulate_inning(away_stats, h_quality, names_debug, sample_num)
             print("  ══════════════════════════════════════════════════════════")
             print()
 
-        # ---- Step 4 & 5: Run 1,000 simulations, count NRFI outcomes ----
-        nrfi_count = sum(
-            1 for _ in range(NUM_SIMULATIONS)
-            if simulate_inning(batters_stats, quality)
-        )
-        nrfi_prob = nrfi_count / NUM_SIMULATIONS
+        # ---- Step 4: Run NUM_SIMULATIONS, track top half, bottom half, and both ----
+        # NRFI requires BOTH halves of the first inning to be scoreless.
+        top_nrfi   = 0   # simulations where away team scored 0 runs
+        bot_nrfi   = 0   # simulations where home team scored 0 runs
+        both_nrfi  = 0   # simulations where NEITHER team scored (true NRFI)
+
+        for _ in range(NUM_SIMULATIONS):
+            top_scoreless = simulate_inning(away_stats, h_quality)
+            bot_scoreless = simulate_inning(home_stats, a_quality)
+            if top_scoreless:
+                top_nrfi += 1
+            if bot_scoreless:
+                bot_nrfi += 1
+            if top_scoreless and bot_scoreless:
+                both_nrfi += 1
+
+        top_prob  = top_nrfi  / NUM_SIMULATIONS
+        bot_prob  = bot_nrfi  / NUM_SIMULATIONS
+        nrfi_prob = both_nrfi / NUM_SIMULATIONS
 
         # ---- Step 5: Derive prediction and confidence ----
         pick = prediction_label(nrfi_prob)
@@ -649,8 +678,13 @@ def main():
 
         # ---- Step 7: Print the per-game result ----
         print(
-            f"  {away_team} @ {home_team}: "
-            f"{nrfi_count}/{NUM_SIMULATIONS} NRFI "
+            f"  Top-half scoreless : {top_nrfi:>4}/{NUM_SIMULATIONS}  ({top_prob * 100:.1f}%)"
+        )
+        print(
+            f"  Bot-half scoreless : {bot_nrfi:>4}/{NUM_SIMULATIONS}  ({bot_prob * 100:.1f}%)"
+        )
+        print(
+            f"  Combined NRFI      : {both_nrfi:>4}/{NUM_SIMULATIONS}  "
             f"→ {nrfi_prob * 100:.1f}% — {conf.upper()} confidence"
         )
         print()
