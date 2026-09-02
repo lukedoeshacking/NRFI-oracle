@@ -522,6 +522,58 @@ def prediction_label(nrfi_prob):
 
 
 # ----------------------------------------------------------
+# Pick of the day
+# ----------------------------------------------------------
+
+def ensure_pick_column():
+    """
+    Add the is_pick_of_the_day column to predictions if it doesn't exist yet.
+
+    Uses ADD COLUMN IF NOT EXISTS so this is safe to run every time the
+    script starts — it does nothing when the column is already there.
+    """
+    try:
+        execute_query(
+            """
+            ALTER TABLE predictions
+            ADD COLUMN IF NOT EXISTS is_pick_of_the_day BOOLEAN DEFAULT FALSE
+            """
+        )
+    except Exception as error:
+        print(f"  Warning: could not add is_pick_of_the_day column — {error}")
+
+
+def get_pick_of_the_day(results):
+    """
+    Return the 1–2 most confident predictions from today's simulation.
+
+    Confidence is measured by how far the probability is from 50%:
+        distance = abs(nrfi_probability - 0.5)
+
+    A strong YRFI (15% NRFI probability, distance 0.35) ranks just as
+    confidently as a strong NRFI (85%, distance 0.35).  This avoids
+    always favouring high-NRFI games over low-NRFI games.
+
+    Number of picks returned:
+        • 1 pick  — when 1–3 games are on the slate (small card)
+        • 2 picks — when 4+ games are on the slate
+
+    Returns a list of result dicts (subset of `results`).
+    """
+    if not results:
+        return []
+
+    sorted_by_confidence = sorted(
+        results,
+        key=lambda r: abs(r["nrfi_probability"] - 0.5),
+        reverse=True,
+    )
+
+    n_picks = 2 if len(results) >= 4 else 1
+    return sorted_by_confidence[:n_picks]
+
+
+# ----------------------------------------------------------
 # Main
 # ----------------------------------------------------------
 def main():
@@ -530,6 +582,10 @@ def main():
 
     print(f"NRFI Oracle Monte Carlo simulation — {today_str}")
     print(f"Running {NUM_SIMULATIONS:,} simulations per game...\n")
+
+    # Make sure the predictions table has the is_pick_of_the_day column.
+    # This is a no-op if the column already exists.
+    ensure_pick_column()
 
     # ---- Step 1: Load today's game slate ----
     if not TODAY_GAMES_PATH.exists():
@@ -555,6 +611,7 @@ def main():
     )
 
     results = []
+    quality_factors = []   # collects every pitcher quality_factor this run
 
     for game_idx, game in enumerate(games):
         away_team    = game.get("away_team")   or "Unknown"
@@ -600,6 +657,7 @@ def main():
             f"K/9={h_k9:.1f} (comp={h_k_comp:.3f})  "
             f"quality={h_quality:.3f}"
         )
+        quality_factors.append(h_quality)
 
         # ---- Step 3b: Away pitcher stats (faces home batters in bottom half) ----
         a_whip, a_k9 = get_pitcher_stats(away_pitcher, game, side="away")
@@ -612,6 +670,7 @@ def main():
             f"K/9={a_k9:.1f} (comp={a_k_comp:.3f})  "
             f"quality={a_quality:.3f}"
         )
+        quality_factors.append(a_quality)
 
         # ---- DEBUG: 3 sample simulations for the first game (top half only) ----
         if game_idx == 0:
@@ -659,14 +718,15 @@ def main():
 
         # ---- Step 6: Save to the predictions table ----
         record = {
-            "game_date":        today_str,
-            "home_team":        home_team,
-            "away_team":        away_team,
-            "home_pitcher":     home_pitcher,
-            "away_pitcher":     away_pitcher,
-            "nrfi_probability": round(nrfi_prob, 4),
-            "prediction":       pick,
-            "confidence":       conf,
+            "game_date":           today_str,
+            "home_team":           home_team,
+            "away_team":           away_team,
+            "home_pitcher":        home_pitcher,
+            "away_pitcher":        away_pitcher,
+            "nrfi_probability":    round(nrfi_prob, 4),
+            "prediction":          pick,
+            "confidence":          conf,
+            "is_pick_of_the_day":  False,
         }
 
         try:
@@ -689,14 +749,59 @@ def main():
         )
         print()
 
+    # ---- Pick of the day ----
+    # Print the average quality_factor so we can immediately spot whether
+    # high NRFI rates are data-driven (strong pitchers) or a calibration bug.
+    if quality_factors:
+        avg_q = sum(quality_factors) / len(quality_factors)
+        below = sum(1 for q in quality_factors if q < 1.0)
+        print(
+            f"Pitcher quality_factor  avg={avg_q:.3f}  "
+            f"({below}/{len(quality_factors)} appearances below 1.0 = above-avg pitchers)\n"
+            f"  (1.00 = league avg  |  <1.00 = pitcher suppresses offence  |  >1.00 = hitter-friendly)\n"
+        )
+    # Select the 1–2 most confident games (furthest from 50%) and mark them
+    # in both the in-memory results list and the predictions table.
+    picks = get_pick_of_the_day(results)
+    pick_keys = {(p["game_date"], p["home_team"], p["away_team"]) for p in picks}
+
+    for pick in picks:
+        # Flip the flag in-memory so the summary print can show the star marker
+        pick["is_pick_of_the_day"] = True
+        try:
+            execute_query(
+                """
+                UPDATE predictions
+                SET    is_pick_of_the_day = TRUE
+                WHERE  game_date = %s
+                  AND  home_team = %s
+                  AND  away_team = %s
+                """,
+                (pick["game_date"], pick["home_team"], pick["away_team"]),
+            )
+        except Exception as error:
+            print(f"  Warning: could not mark pick of the day in DB — {error}")
+
     # ---- Summary ----
     print("=" * 60)
     print(f"Done. Simulated {len(results)} game(s) for {today_str}.\n")
     for r in results:
+        star = " ★" if r.get("is_pick_of_the_day") else "  "
         print(
-            f"  {r['away_team']} @ {r['home_team']:20s}  "
+            f"{star} {r['away_team']} @ {r['home_team']:20s}  "
             f"{r['nrfi_probability'] * 100:.1f}%  {r['prediction']:4s}  {r['confidence']}"
         )
+
+    if picks:
+        print()
+        print("  PICK(S) OF THE DAY:")
+        for p in picks:
+            dist = abs(p["nrfi_probability"] - 0.5) * 100
+            print(
+                f"    ★  {p['away_team']} @ {p['home_team']}"
+                f"  →  {p['prediction']}  "
+                f"({p['nrfi_probability'] * 100:.1f}%,  {dist:.1f}pp from 50%)"
+            )
 
 
 if __name__ == "__main__":

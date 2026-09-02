@@ -42,12 +42,12 @@ if not os.getenv("DATABASE_URL"):
         "DATABASE_URL is missing. Add it to the .env file in the project root."
     )
 
-from db import insert_row  # noqa: E402
+from db import execute_query, insert_row  # noqa: E402
 
 # ----------------------------------------------------------
 # Constants
 # ----------------------------------------------------------
-SEASONS = [2023, 2024, 2025]
+SEASONS = [2023, 2024, 2025, 2026]
 MIN_PLATE_APPEARANCES = 50
 
 # Small pause between per-player API calls to be polite to the MLB API.
@@ -258,6 +258,14 @@ def pull_batters(season):
     team → roster → per-player pipeline.
     """
     print(f"\n=== Batters {season} ===")
+
+    # Remove any existing rows for this season before inserting so that
+    # re-running the script doesn't create duplicate entries.
+    try:
+        execute_query("DELETE FROM batters WHERE season = %s", (season,))
+        print(f"  Cleared existing rows for {season}.")
+    except Exception as err:
+        print(f"  Warning: could not clear {season} rows — {err}")
 
     # Step 1: get all MLB teams.
     print(f"  Fetching MLB teams for {season}...")
