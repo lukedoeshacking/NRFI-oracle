@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -89,7 +90,9 @@ LEAGUE_AVG = {
     "k_rate":         0.230,
 }
 
-REQUEST_DELAY = 0.2   # polite pause (seconds) between MLB Stats API calls
+REQUEST_DELAY = 0.05  # polite pause (seconds) between MLB Stats API calls
+                      # Reduced from 0.2 s — parallel workers spread the load,
+                      # so each worker only fires once every ~0.4 s at 8 workers.
 
 
 # ----------------------------------------------------------
@@ -678,56 +681,81 @@ def main():
     print(f"Today: {len(pitcher_names)} unique pitcher(s), {len(batter_names)} batter(s).\n")
 
     # ── PITCHERS ──────────────────────────────────────────────────────────────
-    print(f"--- Processing {len(pitcher_names)} pitcher(s) ---")
+    print(f"--- Processing {len(pitcher_names)} pitcher(s) in parallel ---")
     pitcher_id_map    = build_pitcher_id_map(season)
     pitcher_comps     = []
     pitchers_saved    = 0
     pitchers_skipped  = 0
 
+    # Build the list of (name, player_id) pairs we can actually process.
+    # Names with no ID (not found in the season stats map) are skipped now
+    # so the thread pool only receives actionable work items.
+    pitchers_to_process = []
     for name in sorted(pitcher_names):
         pid = pitcher_id_map.get(name)
-        if not pid:
+        if pid:
+            pitchers_to_process.append((name, pid))
+        else:
             print(f"  {name}: no player ID found in {season} stats — skipping")
             pitchers_skipped += 1
-            continue
 
-        print(f"  {name} (id={pid})")
-        try:
-            comp = process_pitcher(name, pid, season, today_str)
+    # Fire all game-log requests concurrently.
+    # MAX_WORKERS caps how many outbound HTTP connections are open at once.
+    MAX_WORKERS = 8
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_to_name = {
+            pool.submit(process_pitcher, name, pid, season, today_str): name
+            for name, pid in pitchers_to_process
+        }
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                comp = future.result()
+            except Exception as err:
+                print(f"  {name}: error — {err}")
+                pitchers_skipped += 1
+                continue
+
             if comp:
                 pitcher_comps.append(comp)
                 pitchers_saved += 1
                 b = comp["blended"]
-                print(f"    -> blended ERA={b['era']:.2f}  WHIP={b['whip']:.2f}  "
-                      f"K/9={b['k_per_9']:.1f}  [{comp['tag']}]")
-        except Exception as err:
-            print(f"    Error: {err}")
-            pitchers_skipped += 1
+                print(f"  {name}: blended ERA={b['era']:.2f}  WHIP={b['whip']:.2f}"
+                      f"  K/9={b['k_per_9']:.1f}  [{comp['tag']}]")
+            else:
+                pitchers_skipped += 1
 
     print(f"\nPitchers: {pitchers_saved} saved, {pitchers_skipped} skipped.\n")
 
     # ── BATTERS ───────────────────────────────────────────────────────────────
-    print(f"--- Processing {len(batter_names)} batter(s) ---")
+    print(f"--- Processing {len(batter_names)} batter(s) in parallel ---")
     batter_comps    = []
     batters_saved   = 0
     batters_skipped = 0
 
-    for player_name in batter_names:
-        clean = player_name.replace("[PROJ] ", "").strip()
-        try:
-            comp = process_batter(player_name, season, today_str)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_to_name = {
+            pool.submit(process_batter, player_name, season, today_str): player_name
+            for player_name in batter_names
+        }
+        for future in as_completed(future_to_name):
+            player_name = future_to_name[future]
+            clean = player_name.replace("[PROJ] ", "").strip()
+            try:
+                comp = future.result()
+            except Exception as err:
+                print(f"  {clean}: error — {err}")
+                batters_skipped += 1
+                continue
+
             if comp:
                 batter_comps.append(comp)
                 batters_saved += 1
-                # Only print inline detail for the first 5 to keep output manageable
                 if batters_saved <= 5:
                     b = comp["blended"]
                     print(f"  {clean}: OBP={b['obp']:.3f} SLG={b['slg']:.3f}  [{comp['tag']}]")
             else:
                 batters_skipped += 1
-        except Exception as err:
-            print(f"  {clean}: Error — {err}")
-            batters_skipped += 1
 
     if batters_saved > 5:
         print(f"  ... ({batters_saved - 5} more batters processed)")

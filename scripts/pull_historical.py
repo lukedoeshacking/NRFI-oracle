@@ -40,7 +40,7 @@ if not os.getenv("DATABASE_URL"):
 
 from db import execute_query, insert_row  # noqa: E402
 
-SEASONS = [2023, 2024, 2025]
+SEASONS = [2023, 2024, 2025, 2026]
 
 MLB_STATS_BASE = "https://statsapi.mlb.com/api/v1"
 HTTP_HEADERS = {"User-Agent": "nrfi-oracle-historical-pull"}
