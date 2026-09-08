@@ -14,8 +14,9 @@ Routes at a glance:
     GET  /api/predictions/history     — recent predictions + accuracy stats
 """
 
+import contextlib
+import io
 import os
-import subprocess
 import sys
 from datetime import date, datetime
 from decimal import Decimal
@@ -35,7 +36,14 @@ from db import execute_query, insert_row
 BACKEND_DIR      = Path(__file__).resolve().parent
 PROJECT_ROOT     = BACKEND_DIR.parent
 TODAY_GAMES_PATH = PROJECT_ROOT / "model" / "today_games.json"
-SIMULATE_SCRIPT  = PROJECT_ROOT / "scripts" / "simulate.py"
+SCRIPTS_DIR      = PROJECT_ROOT / "scripts"
+
+# Add scripts/ to Python's module search path so we can import simulate.py
+# directly as a module instead of calling it as a subprocess.  This is what
+# lets the generate endpoint work even when Railway's backend service root
+# directory is set to "backend" and scripts/ is not on the container's PATH.
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 # Load DATABASE_URL (and any other secrets) from the .env file in the
 # project root so they're available to execute_query() below.
@@ -292,12 +300,15 @@ def generate_predictions():
     returns those results as JSON.
 
     How it works:
-      1. Calls scripts/simulate.py as a subprocess.  All the simulation
-         logic (game loading, lineup lookup, pitcher stats, two-half
-         Monte Carlo, pick-of-the-day selection) lives in that one file,
-         so any improvements there automatically flow through this endpoint
-         without touching app.py.
-      2. simulate.py writes its results directly to the DB.
+      1. Imports scripts/simulate.py as a Python module and calls
+         simulate.main() in-process.  All the simulation logic (game
+         loading, lineup lookup, pitcher stats, two-half Monte Carlo,
+         pick-of-the-day selection) lives in that file, so improvements
+         there automatically flow through this endpoint without touching
+         app.py.  Running in-process avoids the subprocess approach that
+         broke when Railway's backend root directory is "backend" and
+         scripts/ was absent from the container.
+      2. simulate.main() writes results directly to the predictions table.
       3. This endpoint reads those rows back and returns them in the same
          format as GET /api/predictions/today.
 
@@ -310,9 +321,8 @@ def generate_predictions():
       }
 
     Error responses:
-      404 — today_games.json not found (run scripts/pull_daily.py first)
-      500 — simulate.py crashed (check "simulation_log" in the response)
-      504 — simulation timed out after 5 minutes
+      404 — no games found for today (run scripts/pull_daily.py first)
+      500 — simulation raised an exception (details in the response)
     """
     # Guard: make sure today's game slate is available before invoking simulate.py.
     # On Railway, the cron service and the API service run in separate containers,
@@ -341,38 +351,30 @@ def generate_predictions():
             status_code=404,
         )
 
-    if not SIMULATE_SCRIPT.exists():
+    # Run the simulation in-process by importing simulate.py as a module.
+    # This avoids spawning a subprocess (which fails when the backend service's
+    # root directory is "backend" and scripts/ isn't on the container filesystem).
+    # SCRIPTS_DIR was already added to sys.path at module load time above.
+    try:
+        import simulate  # noqa: PLC0415 — intentional deferred import
+
+        # Capture every print() call simulate.main() makes so we can return
+        # it in the response as "simulation_log" (same field as before).
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            simulate.main()
+        simulation_log = captured.getvalue()
+
+    except SystemExit as exc:
+        # simulate.py calls raise SystemExit(...) when it can't find games
+        # or is missing DATABASE_URL — surface that as a readable 500.
         return error_response(
-            f"Simulation script not found at {SIMULATE_SCRIPT}.",
+            f"Simulation exited early: {exc}",
             status_code=500,
         )
-
-    try:
-        # Run simulate.py from the project root so its relative path
-        # references (model/, backend/) resolve correctly.
-        # We pass the current process environment so DATABASE_URL and
-        # any other secrets are available inside the subprocess.
-        result = subprocess.run(
-            [sys.executable, str(SIMULATE_SCRIPT)],
-            capture_output=True,
-            text=True,
-            timeout=300,             # 5-minute ceiling for a large slate
-            cwd=str(PROJECT_ROOT),
-            env={**os.environ},
-        )
-
-    except subprocess.TimeoutExpired:
+    except Exception as exc:
         return error_response(
-            "Simulation timed out after 5 minutes. "
-            "Check that the database is reachable and try again.",
-            status_code=504,
-        )
-
-    # A non-zero exit code means simulate.py crashed.
-    if result.returncode != 0:
-        return error_response(
-            f"Simulation script exited with code {result.returncode}. "
-            f"Stderr: {result.stderr[-1000:]}",
+            f"Simulation error: {exc}",
             status_code=500,
         )
 
@@ -409,7 +411,7 @@ def generate_predictions():
         "predictions":     predictions,
         # Include the tail of simulate.py's output so the caller can see
         # quality_factor values, pick-of-the-day selection, etc.
-        "simulation_log":  result.stdout[-3000:],
+        "simulation_log":  simulation_log[-3000:],
     })
 
 
