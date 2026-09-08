@@ -18,6 +18,7 @@ import contextlib
 import io
 import os
 import sys
+import traceback
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -367,14 +368,17 @@ def generate_predictions():
 
     except SystemExit as exc:
         # simulate.py calls raise SystemExit(...) when it can't find games
-        # or is missing DATABASE_URL — surface that as a readable 500.
+        # or is missing DATABASE_URL — include the full traceback so the
+        # exact line and reason are visible in the Railway logs / API response.
+        tb = traceback.format_exc()
         return error_response(
-            f"Simulation exited early: {exc}",
+            f"Simulation exited early: {exc}\n\nTraceback:\n{tb}",
             status_code=500,
         )
     except Exception as exc:
+        tb = traceback.format_exc()
         return error_response(
-            f"Simulation error: {exc}",
+            f"Simulation error: {exc}\n\nTraceback:\n{tb}",
             status_code=500,
         )
 
