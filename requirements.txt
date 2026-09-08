@@ -1,0 +1,16 @@
+# Python packages this backend needs.
+# Install them with: pip install -r requirements.txt
+
+flask              # Web framework — used to build API routes
+flask-cors         # Lets the frontend (browser) call this API without CORS errors
+psycopg2-binary    # Driver that lets Python talk to a PostgreSQL database
+requests           # Makes HTTP requests to the MLB Stats API
+python-dotenv      # Loads secret config (like DATABASE_URL) from a .env file
+gunicorn           # Production web server that runs the Flask app
+
+# --- Used by scripts/train_model.py only (not needed at runtime) ---
+xgboost            # Machine learning library (gradient boosting)
+scikit-learn       # Machine learning tools (preprocessing, metrics)
+pandas             # Tables and data analysis (DataFrames)
+numpy              # Fast numeric arrays and math
+joblib             # Save/load trained ML models to disk
