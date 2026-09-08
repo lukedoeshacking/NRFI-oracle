@@ -325,6 +325,21 @@ def generate_predictions():
       404 — no games found for today (run scripts/pull_daily.py first)
       500 — simulation raised an exception (details in the response)
     """
+    # ----------------------------------------------------------
+    # Auth: reject requests that don't carry the correct cron secret.
+    # Set CRON_SECRET in your environment (Railway + .env for local dev).
+    # The caller must send the header:  X-Cron-Secret: <your-secret>
+    # ----------------------------------------------------------
+    expected_secret = os.environ.get("CRON_SECRET")
+    incoming_secret = request.headers.get("X-Cron-Secret")
+
+    # DEBUG — remove once cron secret mismatch is resolved
+    print(f"EXPECTED starts with: {expected_secret[:4] if expected_secret else 'MISSING'}")
+    print(f"INCOMING starts with: {incoming_secret[:4] if incoming_secret else 'MISSING'}")
+
+    if not expected_secret or incoming_secret != expected_secret:
+        return error_response("Unauthorized", status_code=401)
+
     # Guard: make sure today's game slate is available before invoking simulate.py.
     # On Railway, the cron service and the API service run in separate containers,
     # so today_games.json written by the cron container is never visible here.

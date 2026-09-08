@@ -83,7 +83,17 @@ def main():
     predictions = None
     try:
         print(f"POST {GENERATE_URL}")
-        response = requests.post(GENERATE_URL, timeout=120)
+        # Pass the cron secret so the endpoint accepts this request.
+        # Set CRON_SECRET in Railway's environment variables (and in .env
+        # for local runs) to the same value used by the backend service.
+        cron_secret = os.environ.get("CRON_SECRET", "")
+        # DEBUG — remove once cron secret mismatch is resolved
+        print(f"SENDING secret starting with: {cron_secret[:4] if cron_secret else 'MISSING'}")
+        response = requests.post(
+            GENERATE_URL,
+            headers={"X-Cron-Secret": cron_secret},
+            timeout=120,
+        )
         # Raise if the server returned 4xx/5xx
         try:
             response.raise_for_status()
