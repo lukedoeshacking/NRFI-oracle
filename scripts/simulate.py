@@ -51,7 +51,7 @@ if not os.getenv("DATABASE_URL"):
         "DATABASE_URL is missing. Add it to the .env file in the project root."
     )
 
-from db import execute_query, insert_row  # noqa: E402  (import after path/env setup)
+from db import execute_query, insert_row, get_connection  # noqa: E402  (import after path/env setup)
 
 # ----------------------------------------------------------
 # Constants
@@ -72,13 +72,15 @@ LEAGUE_SLG_PER_OBP = LEAGUE_AVG_SLG / LEAGUE_AVG_OBP  # ≈ 1.28
 # ----------------------------------------------------------
 # Database helpers
 # ----------------------------------------------------------
-def get_lineup(game_date_str, team_name):
+def get_lineup(game_date_str, team_name, conn=None):
     """
     Fetch the top 5 batters for a team on a given date from the lineups table.
 
     The lineups table is populated by pull_lineups.py every morning.
     Returns a list of player name strings in batting order (1–5).
     Returns an empty list when no lineup exists for that team today.
+
+    conn — optional already-open psycopg2 connection (passed from main).
     """
     try:
         rows = execute_query(
@@ -91,6 +93,7 @@ def get_lineup(game_date_str, team_name):
             LIMIT  5
             """,
             (game_date_str, team_name),
+            conn,
         )
         return [row["player_name"] for row in rows]
     except Exception as error:
@@ -98,7 +101,7 @@ def get_lineup(game_date_str, team_name):
         return []
 
 
-def get_batter_stats(player_name):
+def get_batter_stats(player_name, conn=None):
     """
     Return {"obp": float, "slg": float} for a batter, checking three sources
     in priority order:
@@ -110,6 +113,8 @@ def get_batter_stats(player_name):
 
     Falls back to the next source automatically if a table is missing or the
     batter is not found.
+
+    conn — optional already-open psycopg2 connection (passed from main).
     """
     clean_name = player_name.replace("[PROJ] ", "").strip()
 
@@ -124,6 +129,7 @@ def get_batter_stats(player_name):
             LIMIT  1
             """,
             (clean_name,),
+            conn,
         )
         if rows and rows[0].get("blended_obp") is not None:
             return {
@@ -144,6 +150,7 @@ def get_batter_stats(player_name):
             LIMIT  1
             """,
             (clean_name,),
+            conn,
         )
         if rows and rows[0].get("obp") is not None:
             return {
@@ -158,7 +165,7 @@ def get_batter_stats(player_name):
     return {"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}
 
 
-def get_pitcher_stats(pitcher_name, game, side="home"):
+def get_pitcher_stats(pitcher_name, game, side="home", conn=None):
     """
     Return (whip, k_per_9) for a pitcher, checking four sources in order:
 
@@ -172,6 +179,7 @@ def get_pitcher_stats(pitcher_name, game, side="home"):
 
     side : "home" or "away" — controls which fallback key is read from the
            game dict (e.g. "home_pitcher_whip" vs "away_pitcher_whip").
+    conn : optional already-open psycopg2 connection (passed from main).
     """
     if pitcher_name and pitcher_name != "TBD":
 
@@ -186,6 +194,7 @@ def get_pitcher_stats(pitcher_name, game, side="home"):
                 LIMIT  1
                 """,
                 (pitcher_name,),
+                conn,
             )
             if rows and rows[0].get("blended_whip") is not None:
                 return float(rows[0]["blended_whip"]), float(rows[0]["blended_k_per_9"])
@@ -203,6 +212,7 @@ def get_pitcher_stats(pitcher_name, game, side="home"):
                 LIMIT  1
                 """,
                 (pitcher_name,),
+                conn,
             )
             if rows:
                 whip    = rows[0].get("whip")
@@ -528,19 +538,22 @@ def prediction_label(nrfi_prob):
 # Pick of the day
 # ----------------------------------------------------------
 
-def ensure_pick_column():
+def ensure_pick_column(conn=None):
     """
     Add the is_pick_of_the_day column to predictions if it doesn't exist yet.
 
     Uses ADD COLUMN IF NOT EXISTS so this is safe to run every time the
     script starts — it does nothing when the column is already there.
+
+    conn — optional already-open psycopg2 connection (passed from main).
     """
     try:
         execute_query(
             """
             ALTER TABLE predictions
             ADD COLUMN IF NOT EXISTS is_pick_of_the_day BOOLEAN DEFAULT FALSE
-            """
+            """,
+            conn=conn,
         )
     except Exception as error:
         print(f"  Warning: could not add is_pick_of_the_day column — {error}")
@@ -579,7 +592,7 @@ def get_pick_of_the_day(results):
 # ----------------------------------------------------------
 # Game loading (file → DB fallback)
 # ----------------------------------------------------------
-def load_today_games(today_str):
+def load_today_games(today_str, conn=None):
     """
     Return today's game list, trying two sources in order:
 
@@ -590,6 +603,8 @@ def load_today_games(today_str):
 
     Returns a list of game dicts (may be empty if no games today).
     Raises SystemExit if neither source can be read.
+
+    conn — optional already-open psycopg2 connection (passed from main).
     """
     # --- Source 1: JSON file ---
     if TODAY_GAMES_PATH.exists():
@@ -606,6 +621,7 @@ def load_today_games(today_str):
         rows = execute_query(
             "SELECT game_data FROM today_games WHERE game_date = %s ORDER BY id",
             (today_str,),
+            conn,
         )
         if rows is None:
             raise RuntimeError("execute_query returned None")
@@ -628,222 +644,240 @@ def main():
     print(f"NRFI Oracle Monte Carlo simulation — {today_str}")
     print(f"Running {NUM_SIMULATIONS:,} simulations per game...\n")
 
-    # Make sure the predictions table has the is_pick_of_the_day column.
-    # This is a no-op if the column already exists.
-    ensure_pick_column()
+    # ------------------------------------------------------------------
+    # Open ONE database connection for the entire simulation run.
+    # Every DB call below receives this same connection instead of
+    # opening (and closing) its own, saving ~100+ round-trips to Supabase.
+    # The try/finally guarantees the connection is closed even if an
+    # exception is raised partway through.
+    # ------------------------------------------------------------------
+    print("Opening database connection...")
+    conn = get_connection()
 
-    # ---- Step 1: Load today's game slate ----
-    # On Railway each service runs in its own container, so the JSON file
-    # written by the cron container won't exist on the API container.
-    # We try the file first (works locally and in the same container), then
-    # fall back to the today_games database table written by pull_daily.py.
-    games = load_today_games(today_str)
+    try:
+        # Make sure the predictions table has the is_pick_of_the_day column.
+        # This is a no-op if the column already exists.
+        ensure_pick_column(conn)
 
-    if not games:
-        print("No games found for today. Nothing to simulate.")
-        return
+        # ---- Step 1: Load today's game slate ----
+        # On Railway each service runs in its own container, so the JSON file
+        # written by the cron container won't exist on the API container.
+        # We try the file first (works locally and in the same container), then
+        # fall back to the today_games database table written by pull_daily.py.
+        games = load_today_games(today_str, conn)
 
-    print(f"Found {len(games)} game(s). Starting simulations...\n")
+        if not games:
+            print("No games found for today. Nothing to simulate.")
+            return
 
-    # Clear any existing predictions for today so re-running this script
-    # replaces the old rows rather than duplicating them.
-    execute_query(
-        "DELETE FROM predictions WHERE game_date = %s",
-        (today_str,),
-    )
+        print(f"Found {len(games)} game(s). Starting simulations...\n")
 
-    results = []
-    quality_factors = []   # collects every pitcher quality_factor this run
-
-    for game_idx, game in enumerate(games):
-        away_team    = game.get("away_team")   or "Unknown"
-        home_team    = game.get("home_team")   or "Unknown"
-        home_pitcher = game.get("home_pitcher") or "TBD"
-        away_pitcher = game.get("away_pitcher") or "TBD"
-
-        print(f"{away_team} @ {home_team}")
-        print(f"  TOP: {away_team} bat vs {home_pitcher}  |  BOT: {home_team} bat vs {away_pitcher}")
-
-        # ---- Step 2a: Away lineup (top of 1st — away team bats vs home pitcher) ----
-        away_lineup = get_lineup(today_str, away_team)
-        if not away_lineup:
-            print(f"  No lineup found for {away_team} — using 5 league-avg batters")
-            away_stats = [{"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}] * 5
-        else:
-            preview = ", ".join(away_lineup[:3])
-            print(f"  {away_team} lineup: {preview}{'...' if len(away_lineup) > 3 else ''}")
-            away_stats = [get_batter_stats(name) for name in away_lineup]
-            while len(away_stats) < 5:
-                away_stats.append({"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG})
-
-        # ---- Step 2b: Home lineup (bottom of 1st — home team bats vs away pitcher) ----
-        home_lineup = get_lineup(today_str, home_team)
-        if not home_lineup:
-            print(f"  No lineup found for {home_team} — using 5 league-avg batters")
-            home_stats = [{"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}] * 5
-        else:
-            preview = ", ".join(home_lineup[:3])
-            print(f"  {home_team} lineup: {preview}{'...' if len(home_lineup) > 3 else ''}")
-            home_stats = [get_batter_stats(name) for name in home_lineup]
-            while len(home_stats) < 5:
-                home_stats.append({"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG})
-
-        # ---- Step 3a: Home pitcher stats (faces away batters in top half) ----
-        h_whip, h_k9 = get_pitcher_stats(home_pitcher, game, side="home")
-        h_quality     = calc_quality_factor(h_whip, h_k9)
-        h_whip_comp   = h_whip / LEAGUE_AVG_WHIP
-        h_k_comp      = LEAGUE_AVG_K9 / max(h_k9, 0.1)
-        print(
-            f"  [TOP] {home_pitcher}: "
-            f"WHIP={h_whip:.2f} (comp={h_whip_comp:.3f})  "
-            f"K/9={h_k9:.1f} (comp={h_k_comp:.3f})  "
-            f"quality={h_quality:.3f}"
-        )
-        quality_factors.append(h_quality)
-
-        # ---- Step 3b: Away pitcher stats (faces home batters in bottom half) ----
-        a_whip, a_k9 = get_pitcher_stats(away_pitcher, game, side="away")
-        a_quality     = calc_quality_factor(a_whip, a_k9)
-        a_whip_comp   = a_whip / LEAGUE_AVG_WHIP
-        a_k_comp      = LEAGUE_AVG_K9 / max(a_k9, 0.1)
-        print(
-            f"  [BOT] {away_pitcher}: "
-            f"WHIP={a_whip:.2f} (comp={a_whip_comp:.3f})  "
-            f"K/9={a_k9:.1f} (comp={a_k_comp:.3f})  "
-            f"quality={a_quality:.3f}"
-        )
-        quality_factors.append(a_quality)
-
-        # ---- DEBUG: 3 sample simulations for the first game (top half only) ----
-        if game_idx == 0:
-            print()
-            print("  ══════════════════════════════════════════════════════════")
-            print(f"  DEBUG — 3 sample TOP-half simulations for: {away_team} @ {home_team}")
-            print()
-            print(f"  Home pitcher quality factor breakdown:")
-            print(f"    WHIP: {h_whip:.2f}/{LEAGUE_AVG_WHIP} = {h_whip_comp:.3f}  |  K/9: {LEAGUE_AVG_K9}/{h_k9:.1f} = {h_k_comp:.3f}  |  avg = {h_quality:.3f}")
-            print()
-            print(f"  {away_team} batter OBP/SLG (top-half batters):")
-            names_debug = away_lineup if away_lineup else [f"Batter {i+1}" for i in range(5)]
-            for i, (name, stats) in enumerate(zip(names_debug, away_stats), start=1):
-                eff = min(stats["obp"] * h_quality, 0.95)
-                print(f"    #{i}  {name.replace('[PROJ] ', ''):<22s}  OBP={stats['obp']:.3f}  SLG={stats['slg']:.3f}  eff_OBP={eff:.3f}")
-            print()
-            for sample_num in range(1, 4):
-                debug_simulate_inning(away_stats, h_quality, names_debug, sample_num)
-            print("  ══════════════════════════════════════════════════════════")
-            print()
-
-        # ---- Step 4: Run NUM_SIMULATIONS, track top half, bottom half, and both ----
-        # NRFI requires BOTH halves of the first inning to be scoreless.
-        top_nrfi   = 0   # simulations where away team scored 0 runs
-        bot_nrfi   = 0   # simulations where home team scored 0 runs
-        both_nrfi  = 0   # simulations where NEITHER team scored (true NRFI)
-
-        for _ in range(NUM_SIMULATIONS):
-            top_scoreless = simulate_inning(away_stats, h_quality)
-            bot_scoreless = simulate_inning(home_stats, a_quality)
-            if top_scoreless:
-                top_nrfi += 1
-            if bot_scoreless:
-                bot_nrfi += 1
-            if top_scoreless and bot_scoreless:
-                both_nrfi += 1
-
-        top_prob  = top_nrfi  / NUM_SIMULATIONS
-        bot_prob  = bot_nrfi  / NUM_SIMULATIONS
-        nrfi_prob = both_nrfi / NUM_SIMULATIONS
-
-        # ---- Step 5: Derive prediction and confidence ----
-        pick = prediction_label(nrfi_prob)
-        conf = confidence_label(nrfi_prob)
-
-        # ---- Step 6: Save to the predictions table ----
-        record = {
-            "game_date":           today_str,
-            "home_team":           home_team,
-            "away_team":           away_team,
-            "home_pitcher":        home_pitcher,
-            "away_pitcher":        away_pitcher,
-            "nrfi_probability":    round(nrfi_prob, 4),
-            "prediction":          pick,
-            "confidence":          conf,
-            "is_pick_of_the_day":  False,
-        }
-
-        try:
-            insert_row("predictions", record)
-        except Exception as error:
-            print(f"  Warning: could not save prediction to DB — {error}")
-
-        results.append(record)
-
-        # ---- Step 7: Print the per-game result ----
-        print(
-            f"  Top-half scoreless : {top_nrfi:>4}/{NUM_SIMULATIONS}  ({top_prob * 100:.1f}%)"
-        )
-        print(
-            f"  Bot-half scoreless : {bot_nrfi:>4}/{NUM_SIMULATIONS}  ({bot_prob * 100:.1f}%)"
-        )
-        print(
-            f"  Combined NRFI      : {both_nrfi:>4}/{NUM_SIMULATIONS}  "
-            f"→ {nrfi_prob * 100:.1f}% — {conf.upper()} confidence"
-        )
-        print()
-
-    # ---- Pick of the day ----
-    # Print the average quality_factor so we can immediately spot whether
-    # high NRFI rates are data-driven (strong pitchers) or a calibration bug.
-    if quality_factors:
-        avg_q = sum(quality_factors) / len(quality_factors)
-        below = sum(1 for q in quality_factors if q < 1.0)
-        print(
-            f"Pitcher quality_factor  avg={avg_q:.3f}  "
-            f"({below}/{len(quality_factors)} appearances below 1.0 = above-avg pitchers)\n"
-            f"  (1.00 = league avg  |  <1.00 = pitcher suppresses offence  |  >1.00 = hitter-friendly)\n"
-        )
-    # Select the 1–2 most confident games (furthest from 50%) and mark them
-    # in both the in-memory results list and the predictions table.
-    picks = get_pick_of_the_day(results)
-    pick_keys = {(p["game_date"], p["home_team"], p["away_team"]) for p in picks}
-
-    for pick in picks:
-        # Flip the flag in-memory so the summary print can show the star marker
-        pick["is_pick_of_the_day"] = True
-        try:
-            execute_query(
-                """
-                UPDATE predictions
-                SET    is_pick_of_the_day = TRUE
-                WHERE  game_date = %s
-                  AND  home_team = %s
-                  AND  away_team = %s
-                """,
-                (pick["game_date"], pick["home_team"], pick["away_team"]),
-            )
-        except Exception as error:
-            print(f"  Warning: could not mark pick of the day in DB — {error}")
-
-    # ---- Summary ----
-    print("=" * 60)
-    print(f"Done. Simulated {len(results)} game(s) for {today_str}.\n")
-    for r in results:
-        star = " ★" if r.get("is_pick_of_the_day") else "  "
-        print(
-            f"{star} {r['away_team']} @ {r['home_team']:20s}  "
-            f"{r['nrfi_probability'] * 100:.1f}%  {r['prediction']:4s}  {r['confidence']}"
+        # Clear any existing predictions for today so re-running this script
+        # replaces the old rows rather than duplicating them.
+        execute_query(
+            "DELETE FROM predictions WHERE game_date = %s",
+            (today_str,),
+            conn,
         )
 
-    if picks:
-        print()
-        print("  PICK(S) OF THE DAY:")
-        for p in picks:
-            dist = abs(p["nrfi_probability"] - 0.5) * 100
+        results = []
+        quality_factors = []   # collects every pitcher quality_factor this run
+
+        for game_idx, game in enumerate(games):
+            away_team    = game.get("away_team")   or "Unknown"
+            home_team    = game.get("home_team")   or "Unknown"
+            home_pitcher = game.get("home_pitcher") or "TBD"
+            away_pitcher = game.get("away_pitcher") or "TBD"
+
+            print(f"{away_team} @ {home_team}")
+            print(f"  TOP: {away_team} bat vs {home_pitcher}  |  BOT: {home_team} bat vs {away_pitcher}")
+
+            # ---- Step 2a: Away lineup (top of 1st — away team bats vs home pitcher) ----
+            away_lineup = get_lineup(today_str, away_team, conn)
+            if not away_lineup:
+                print(f"  No lineup found for {away_team} — using 5 league-avg batters")
+                away_stats = [{"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}] * 5
+            else:
+                preview = ", ".join(away_lineup[:3])
+                print(f"  {away_team} lineup: {preview}{'...' if len(away_lineup) > 3 else ''}")
+                away_stats = [get_batter_stats(name, conn) for name in away_lineup]
+                while len(away_stats) < 5:
+                    away_stats.append({"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG})
+
+            # ---- Step 2b: Home lineup (bottom of 1st — home team bats vs away pitcher) ----
+            home_lineup = get_lineup(today_str, home_team, conn)
+            if not home_lineup:
+                print(f"  No lineup found for {home_team} — using 5 league-avg batters")
+                home_stats = [{"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG}] * 5
+            else:
+                preview = ", ".join(home_lineup[:3])
+                print(f"  {home_team} lineup: {preview}{'...' if len(home_lineup) > 3 else ''}")
+                home_stats = [get_batter_stats(name, conn) for name in home_lineup]
+                while len(home_stats) < 5:
+                    home_stats.append({"obp": LEAGUE_AVG_OBP, "slg": LEAGUE_AVG_SLG})
+
+            # ---- Step 3a: Home pitcher stats (faces away batters in top half) ----
+            h_whip, h_k9 = get_pitcher_stats(home_pitcher, game, side="home", conn=conn)
+            h_quality     = calc_quality_factor(h_whip, h_k9)
+            h_whip_comp   = h_whip / LEAGUE_AVG_WHIP
+            h_k_comp      = LEAGUE_AVG_K9 / max(h_k9, 0.1)
             print(
-                f"    ★  {p['away_team']} @ {p['home_team']}"
-                f"  →  {p['prediction']}  "
-                f"({p['nrfi_probability'] * 100:.1f}%,  {dist:.1f}pp from 50%)"
+                f"  [TOP] {home_pitcher}: "
+                f"WHIP={h_whip:.2f} (comp={h_whip_comp:.3f})  "
+                f"K/9={h_k9:.1f} (comp={h_k_comp:.3f})  "
+                f"quality={h_quality:.3f}"
             )
+            quality_factors.append(h_quality)
+
+            # ---- Step 3b: Away pitcher stats (faces home batters in bottom half) ----
+            a_whip, a_k9 = get_pitcher_stats(away_pitcher, game, side="away", conn=conn)
+            a_quality     = calc_quality_factor(a_whip, a_k9)
+            a_whip_comp   = a_whip / LEAGUE_AVG_WHIP
+            a_k_comp      = LEAGUE_AVG_K9 / max(a_k9, 0.1)
+            print(
+                f"  [BOT] {away_pitcher}: "
+                f"WHIP={a_whip:.2f} (comp={a_whip_comp:.3f})  "
+                f"K/9={a_k9:.1f} (comp={a_k_comp:.3f})  "
+                f"quality={a_quality:.3f}"
+            )
+            quality_factors.append(a_quality)
+
+            # ---- DEBUG: 3 sample simulations for the first game (top half only) ----
+            if game_idx == 0:
+                print()
+                print("  ══════════════════════════════════════════════════════════")
+                print(f"  DEBUG — 3 sample TOP-half simulations for: {away_team} @ {home_team}")
+                print()
+                print(f"  Home pitcher quality factor breakdown:")
+                print(f"    WHIP: {h_whip:.2f}/{LEAGUE_AVG_WHIP} = {h_whip_comp:.3f}  |  K/9: {LEAGUE_AVG_K9}/{h_k9:.1f} = {h_k_comp:.3f}  |  avg = {h_quality:.3f}")
+                print()
+                print(f"  {away_team} batter OBP/SLG (top-half batters):")
+                names_debug = away_lineup if away_lineup else [f"Batter {i+1}" for i in range(5)]
+                for i, (name, stats) in enumerate(zip(names_debug, away_stats), start=1):
+                    eff = min(stats["obp"] * h_quality, 0.95)
+                    print(f"    #{i}  {name.replace('[PROJ] ', ''):<22s}  OBP={stats['obp']:.3f}  SLG={stats['slg']:.3f}  eff_OBP={eff:.3f}")
+                print()
+                for sample_num in range(1, 4):
+                    debug_simulate_inning(away_stats, h_quality, names_debug, sample_num)
+                print("  ══════════════════════════════════════════════════════════")
+                print()
+
+            # ---- Step 4: Run NUM_SIMULATIONS, track top half, bottom half, and both ----
+            # NRFI requires BOTH halves of the first inning to be scoreless.
+            top_nrfi   = 0   # simulations where away team scored 0 runs
+            bot_nrfi   = 0   # simulations where home team scored 0 runs
+            both_nrfi  = 0   # simulations where NEITHER team scored (true NRFI)
+
+            for _ in range(NUM_SIMULATIONS):
+                top_scoreless = simulate_inning(away_stats, h_quality)
+                bot_scoreless = simulate_inning(home_stats, a_quality)
+                if top_scoreless:
+                    top_nrfi += 1
+                if bot_scoreless:
+                    bot_nrfi += 1
+                if top_scoreless and bot_scoreless:
+                    both_nrfi += 1
+
+            top_prob  = top_nrfi  / NUM_SIMULATIONS
+            bot_prob  = bot_nrfi  / NUM_SIMULATIONS
+            nrfi_prob = both_nrfi / NUM_SIMULATIONS
+
+            # ---- Step 5: Derive prediction and confidence ----
+            pick = prediction_label(nrfi_prob)
+            conf = confidence_label(nrfi_prob)
+
+            # ---- Step 6: Save to the predictions table ----
+            record = {
+                "game_date":           today_str,
+                "home_team":           home_team,
+                "away_team":           away_team,
+                "home_pitcher":        home_pitcher,
+                "away_pitcher":        away_pitcher,
+                "nrfi_probability":    round(nrfi_prob, 4),
+                "prediction":          pick,
+                "confidence":          conf,
+                "is_pick_of_the_day":  False,
+            }
+
+            try:
+                insert_row("predictions", record, conn)
+            except Exception as error:
+                print(f"  Warning: could not save prediction to DB — {error}")
+
+            results.append(record)
+
+            # ---- Step 7: Print the per-game result ----
+            print(
+                f"  Top-half scoreless : {top_nrfi:>4}/{NUM_SIMULATIONS}  ({top_prob * 100:.1f}%)"
+            )
+            print(
+                f"  Bot-half scoreless : {bot_nrfi:>4}/{NUM_SIMULATIONS}  ({bot_prob * 100:.1f}%)"
+            )
+            print(
+                f"  Combined NRFI      : {both_nrfi:>4}/{NUM_SIMULATIONS}  "
+                f"→ {nrfi_prob * 100:.1f}% — {conf.upper()} confidence"
+            )
+            print()
+
+        # ---- Pick of the day ----
+        # Print the average quality_factor so we can immediately spot whether
+        # high NRFI rates are data-driven (strong pitchers) or a calibration bug.
+        if quality_factors:
+            avg_q = sum(quality_factors) / len(quality_factors)
+            below = sum(1 for q in quality_factors if q < 1.0)
+            print(
+                f"Pitcher quality_factor  avg={avg_q:.3f}  "
+                f"({below}/{len(quality_factors)} appearances below 1.0 = above-avg pitchers)\n"
+                f"  (1.00 = league avg  |  <1.00 = pitcher suppresses offence  |  >1.00 = hitter-friendly)\n"
+            )
+        # Select the 1–2 most confident games (furthest from 50%) and mark them
+        # in both the in-memory results list and the predictions table.
+        picks = get_pick_of_the_day(results)
+        pick_keys = {(p["game_date"], p["home_team"], p["away_team"]) for p in picks}
+
+        for pick in picks:
+            # Flip the flag in-memory so the summary print can show the star marker
+            pick["is_pick_of_the_day"] = True
+            try:
+                execute_query(
+                    """
+                    UPDATE predictions
+                    SET    is_pick_of_the_day = TRUE
+                    WHERE  game_date = %s
+                      AND  home_team = %s
+                      AND  away_team = %s
+                    """,
+                    (pick["game_date"], pick["home_team"], pick["away_team"]),
+                    conn,
+                )
+            except Exception as error:
+                print(f"  Warning: could not mark pick of the day in DB — {error}")
+
+        # ---- Summary ----
+        print("=" * 60)
+        print(f"Done. Simulated {len(results)} game(s) for {today_str}.\n")
+        for r in results:
+            star = " ★" if r.get("is_pick_of_the_day") else "  "
+            print(
+                f"{star} {r['away_team']} @ {r['home_team']:20s}  "
+                f"{r['nrfi_probability'] * 100:.1f}%  {r['prediction']:4s}  {r['confidence']}"
+            )
+
+        if picks:
+            print()
+            print("  PICK(S) OF THE DAY:")
+            for p in picks:
+                dist = abs(p["nrfi_probability"] - 0.5) * 100
+                print(
+                    f"    ★  {p['away_team']} @ {p['home_team']}"
+                    f"  →  {p['prediction']}  "
+                    f"({p['nrfi_probability'] * 100:.1f}%,  {dist:.1f}pp from 50%)"
+                )
+
+    finally:
+        # Close the single shared connection — runs even if an exception occurred.
+        conn.close()
+        print("\nDatabase connection closed.")
 
 
 if __name__ == "__main__":

@@ -50,13 +50,18 @@ def get_connection():
     return connection
 
 
-def execute_query(query, params=None):
+def execute_query(query, params=None, conn=None):
     """
     Run any SQL statement and return rows as a list of dictionaries.
 
     query  — SQL string, e.g. "SELECT * FROM games WHERE id = %s"
     params — optional tuple/list/dict of values that fill in the %s placeholders.
              Using params (not string concatenation) prevents SQL injection.
+    conn   — optional already-open psycopg2 connection.
+             When provided, it is reused and NOT closed when done (the caller
+             is responsible for closing it).
+             When None (default), a new connection is opened and closed
+             automatically — the original behaviour for all other callers.
 
     Example:
         rows = execute_query("SELECT * FROM games WHERE id = %s", (42,))
@@ -64,30 +69,34 @@ def execute_query(query, params=None):
 
     For INSERT/UPDATE/DELETE that do not return rows, this returns an empty list.
     """
-    connection = get_connection()
+    _own_conn = conn is None      # True when we opened the connection ourselves
+    if _own_conn:
+        conn = get_connection()
     try:
         # RealDictCursor makes each row a dict keyed by column name
         # instead of a plain tuple like (1, "NYY")
-        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(query, params)
 
             # cursor.description is None when the statement has no result set
             # (for example a plain INSERT without RETURNING)
             if cursor.description is None:
-                connection.commit()  # save the change permanently
+                conn.commit()  # save the change permanently
                 return []
 
             rows = cursor.fetchall()
-            connection.commit()
+            conn.commit()
             # RealDictRow is dict-like; convert to a normal dict for simplicity
             return [dict(row) for row in rows]
     except Exception:
         # If something went wrong, undo the transaction so the DB stays consistent
-        connection.rollback()
+        conn.rollback()
         raise
     finally:
-        # Always close the connection, even if an error happened
-        connection.close()
+        # Only close the connection when we opened it ourselves.
+        # When the caller passed their own conn, they are responsible for closing it.
+        if _own_conn:
+            conn.close()
 
 
 def _safe_identifier(name):
@@ -102,12 +111,13 @@ def _safe_identifier(name):
     return str(name)
 
 
-def insert_row(table, data_dict):
+def insert_row(table, data_dict, conn=None):
     """
     Build and run an INSERT for one row.
 
     table     — table name as a string, e.g. "games"
     data_dict — column names and values, e.g. {"home_team": "NYY", "away_team": "BOS"}
+    conn      — optional already-open psycopg2 connection (see execute_query).
 
     Returns the inserted row as a list of one dict (because of RETURNING *).
     """
@@ -127,7 +137,7 @@ def insert_row(table, data_dict):
     # (useful for reading default values like an auto-generated id)
     query = f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders}) RETURNING *"
 
-    return execute_query(query, values)
+    return execute_query(query, values, conn=conn)
 
 
 if __name__ == "__main__":
