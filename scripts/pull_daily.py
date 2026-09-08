@@ -50,6 +50,53 @@ if not os.getenv("DATABASE_URL"):
 from db import execute_query  # noqa: E402  (import after path/env setup)
 
 # ----------------------------------------------------------
+# Database table setup
+# ----------------------------------------------------------
+def ensure_today_games_table():
+    """
+    Create the today_games table if it doesn't exist yet.
+
+    Each row holds one game's worth of stats as a JSONB blob so any
+    Railway service (cron, API) can read it — no shared filesystem needed.
+    Safe to call every run; CREATE TABLE IF NOT EXISTS is a no-op when the
+    table already exists.
+    """
+    execute_query(
+        """
+        CREATE TABLE IF NOT EXISTS today_games (
+            id         SERIAL    PRIMARY KEY,
+            game_date  DATE      NOT NULL,
+            game_data  JSONB     NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        """
+    )
+
+
+def save_games_to_db(games_out, today_str):
+    """
+    Upsert today's game slate into the today_games table.
+
+    We delete the existing rows for today first so re-running the script
+    gives a fresh slate rather than duplicate rows.
+    """
+    try:
+        execute_query(
+            "DELETE FROM today_games WHERE game_date = %s",
+            (today_str,),
+        )
+        for game in games_out:
+            execute_query(
+                "INSERT INTO today_games (game_date, game_data) VALUES (%s, %s::jsonb)",
+                (today_str, json.dumps(game)),
+            )
+        print(f"Saved {len(games_out)} game(s) to today_games table in DB.")
+    except Exception as error:
+        # Not fatal — the JSON file is still available for local use.
+        print(f"Warning: could not save games to DB today_games table — {error}")
+
+
+# ----------------------------------------------------------
 # Constants
 # ----------------------------------------------------------
 MLB_STATS_BASE = "https://statsapi.mlb.com/api/v1"
@@ -214,6 +261,10 @@ def main():
     today_str = today.isoformat()
 
     print(f"NRFI Oracle daily pull — {today_str}")
+
+    # Make sure the today_games table exists before we try to write to it.
+    ensure_today_games_table()
+
     print("Fetching today's schedule from MLB Stats API...")
 
     # Hit the schedule endpoint, asking it to include probablePitcher data
@@ -238,6 +289,8 @@ def main():
         MODEL_DIR.mkdir(exist_ok=True)
         TODAY_GAMES_PATH.write_text(json.dumps([], indent=2), encoding="utf-8")
         print(f"Wrote empty game list to {TODAY_GAMES_PATH}")
+        # Clear any stale DB rows for today so the API also sees an empty slate.
+        save_games_to_db([], today_str)
         return
 
     print(f"Found {len(raw_games)} game(s) on the schedule. Looking up stats...\n")
@@ -295,7 +348,7 @@ def main():
         games_out.append(game_obj)
         print()
 
-    # --- Write output file ---
+    # --- Write output file (used locally and by simulate.py when present) ---
     MODEL_DIR.mkdir(exist_ok=True)
     TODAY_GAMES_PATH.write_text(
         json.dumps(games_out, indent=2),
@@ -304,6 +357,12 @@ def main():
 
     print(f"Found {len(games_out)} games today.")
     print(f"Saved to {TODAY_GAMES_PATH}")
+
+    # --- Also write to the DB so cross-service calls work on Railway ---
+    # On Railway each service has its own isolated filesystem, so the API
+    # container can't read the file written by the cron container.  Storing
+    # the games in the shared PostgreSQL database fixes that.
+    save_games_to_db(games_out, today_str)
 
 
 if __name__ == "__main__":

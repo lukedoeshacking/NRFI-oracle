@@ -314,11 +314,30 @@ def generate_predictions():
       500 — simulate.py crashed (check "simulation_log" in the response)
       504 — simulation timed out after 5 minutes
     """
-    # Guard: today_games.json must already exist (pull_daily.py creates it).
-    if not TODAY_GAMES_PATH.exists():
+    # Guard: make sure today's game slate is available before invoking simulate.py.
+    # On Railway, the cron service and the API service run in separate containers,
+    # so today_games.json written by the cron container is never visible here.
+    # We therefore check the today_games DB table first (populated by pull_daily.py
+    # alongside the JSON file), and only fall back to the file check for local dev.
+    slate_ready = False
+    try:
+        rows = execute_query(
+            "SELECT COUNT(*) AS n FROM today_games WHERE game_date = CURRENT_DATE"
+        )
+        if rows and int(rows[0].get("n", 0)) > 0:
+            slate_ready = True
+    except Exception:
+        # Table may not exist yet on first run — fall back to file check below.
+        pass
+
+    if not slate_ready and TODAY_GAMES_PATH.exists():
+        slate_ready = True   # local dev: JSON file is enough
+
+    if not slate_ready:
         return error_response(
-            f"today_games.json not found at {TODAY_GAMES_PATH}. "
-            "Run scripts/pull_daily.py first to fetch today's slate.",
+            "No games found for today. "
+            "Run scripts/pull_daily.py first to fetch today's slate "
+            "(it writes to both today_games.json and the today_games DB table).",
             status_code=404,
         )
 

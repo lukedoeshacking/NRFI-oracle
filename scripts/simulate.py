@@ -574,6 +574,48 @@ def get_pick_of_the_day(results):
 
 
 # ----------------------------------------------------------
+# Game loading (file → DB fallback)
+# ----------------------------------------------------------
+def load_today_games(today_str):
+    """
+    Return today's game list, trying two sources in order:
+
+      1. model/today_games.json — fastest; available when running locally or
+         when pull_daily.py ran in the same container (e.g. local dev).
+      2. today_games database table — used on Railway where the cron service
+         and the API service each have their own isolated filesystem.
+
+    Returns a list of game dicts (may be empty if no games today).
+    Raises SystemExit if neither source can be read.
+    """
+    # --- Source 1: JSON file ---
+    if TODAY_GAMES_PATH.exists():
+        print(f"Loading games from {TODAY_GAMES_PATH}")
+        with TODAY_GAMES_PATH.open(encoding="utf-8") as fh:
+            return json.load(fh)
+
+    # --- Source 2: today_games DB table ---
+    print(
+        f"today_games.json not found at {TODAY_GAMES_PATH} — "
+        "loading from today_games database table instead."
+    )
+    try:
+        rows = execute_query(
+            "SELECT game_data FROM today_games WHERE game_date = %s ORDER BY id",
+            (today_str,),
+        )
+        if rows is None:
+            raise RuntimeError("execute_query returned None")
+        # psycopg2 deserialises JSONB columns to Python dicts automatically.
+        return [row["game_data"] for row in rows]
+    except Exception as error:
+        raise SystemExit(
+            f"Could not load today's games from DB: {error}\n"
+            "Run scripts/pull_daily.py first to populate the today_games table."
+        )
+
+
+# ----------------------------------------------------------
 # Main
 # ----------------------------------------------------------
 def main():
@@ -588,17 +630,14 @@ def main():
     ensure_pick_column()
 
     # ---- Step 1: Load today's game slate ----
-    if not TODAY_GAMES_PATH.exists():
-        raise SystemExit(
-            f"Could not find {TODAY_GAMES_PATH}.\n"
-            "Run  python scripts/pull_daily.py  first to create today_games.json."
-        )
-
-    with TODAY_GAMES_PATH.open(encoding="utf-8") as fh:
-        games = json.load(fh)
+    # On Railway each service runs in its own container, so the JSON file
+    # written by the cron container won't exist on the API container.
+    # We try the file first (works locally and in the same container), then
+    # fall back to the today_games database table written by pull_daily.py.
+    games = load_today_games(today_str)
 
     if not games:
-        print("No games in today_games.json. Nothing to simulate.")
+        print("No games found for today. Nothing to simulate.")
         return
 
     print(f"Found {len(games)} game(s). Starting simulations...\n")
