@@ -9,6 +9,7 @@ It pulls today's games, then asks the Flask API to generate predictions.
 If a step fails, we print the error and keep going instead of crashing.
 """
 
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -20,7 +21,14 @@ import requests
 SCRIPTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPTS_DIR.parent
 PULL_DAILY = SCRIPTS_DIR / "pull_daily.py"
-GENERATE_URL = "http://localhost:5000/api/predictions/generate"
+
+# Read the backend base URL from the environment so this script works both
+# locally (defaults to localhost) and on Railway (where each service has its
+# own container and localhost won't reach the API service).
+# Set BACKEND_API_URL in Railway's environment variables to something like:
+#   https://your-backend-service.up.railway.app
+BACKEND_BASE_URL = os.environ.get("BACKEND_API_URL", "http://localhost:5000")
+GENERATE_URL = f"{BACKEND_BASE_URL.rstrip('/')}/api/predictions/generate"
 
 
 def print_step_error(step_number, error):
