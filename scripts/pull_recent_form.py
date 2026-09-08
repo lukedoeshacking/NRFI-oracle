@@ -38,7 +38,9 @@ BACKEND_DIR      = PROJECT_ROOT / "backend"
 MODEL_DIR        = PROJECT_ROOT / "model"
 TODAY_GAMES_PATH = MODEL_DIR / "today_games.json"
 
-sys.path.insert(0, str(BACKEND_DIR))
+# Guard prevents duplicate entries when this module is imported more than once.
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv()

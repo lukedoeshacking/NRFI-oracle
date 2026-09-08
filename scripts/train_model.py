@@ -41,7 +41,9 @@ MODEL_PATH = MODEL_DIR / "nrfi_model.pkl"
 
 # db.py is inside /backend, not on Python's default import path.
 # Inserting that folder first lets us write: from db import execute_query
-sys.path.insert(0, str(BACKEND_DIR))
+# Guard prevents duplicate entries when this module is imported more than once.
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 # Load DATABASE_URL (and any other secrets) from the project-root .env file.
 # db.py also loads .env, but we do it here so this script is explicit.

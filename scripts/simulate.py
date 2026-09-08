@@ -36,8 +36,11 @@ BACKEND_DIR  = PROJECT_ROOT / "backend"
 MODEL_DIR    = PROJECT_ROOT / "model"
 TODAY_GAMES_PATH = MODEL_DIR / "today_games.json"
 
-# Add /backend to Python's search path so we can import db.py
-sys.path.insert(0, str(BACKEND_DIR))
+# Add /backend to Python's module search path so "from db import ..." works
+# whether this file is run directly, called as a subprocess, or imported as
+# a module from app.py.  The guard prevents duplicate entries on repeated imports.
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 # Load DATABASE_URL from the .env file at the project root
 load_dotenv(PROJECT_ROOT / ".env")

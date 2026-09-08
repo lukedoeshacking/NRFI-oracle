@@ -36,7 +36,9 @@ MODEL_DIR = PROJECT_ROOT / "model"
 TODAY_GAMES_PATH = MODEL_DIR / "today_games.json"
 
 # Add /backend to the import path so we can do "from db import ..."
-sys.path.insert(0, str(BACKEND_DIR))
+# Guard prevents duplicate entries when this module is imported more than once.
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 # Load DATABASE_URL from .env in the project root
 load_dotenv(PROJECT_ROOT / ".env")
