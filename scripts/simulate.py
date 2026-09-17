@@ -596,8 +596,10 @@ def load_today_games(today_str, conn=None):
     """
     Return today's game list, trying two sources in order:
 
-      1. model/today_games.json — fastest; available when running locally or
-         when pull_daily.py ran in the same container (e.g. local dev).
+      1. model/today_games.json — only trusted if the games inside it are
+         actually dated for today. A leftover file from a previous day
+         (e.g. accidentally committed to git) is ignored instead of silently
+         reused.
       2. today_games database table — used on Railway where the cron service
          and the API service each have their own isolated filesystem.
 
@@ -606,17 +608,22 @@ def load_today_games(today_str, conn=None):
 
     conn — optional already-open psycopg2 connection (passed from main).
     """
-    # --- Source 1: JSON file ---
+    # --- Source 1: JSON file, but only if it's actually for TODAY ---
     if TODAY_GAMES_PATH.exists():
-        print(f"Loading games from {TODAY_GAMES_PATH}")
         with TODAY_GAMES_PATH.open(encoding="utf-8") as fh:
-            return json.load(fh)
+            file_games = json.load(fh)
+        if file_games and file_games[0].get("game_date") == today_str:
+            print(f"Loading games from {TODAY_GAMES_PATH} (confirmed fresh for {today_str})")
+            return file_games
+        else:
+            stale_date = file_games[0].get("game_date") if file_games else "unknown"
+            print(
+                f"{TODAY_GAMES_PATH} exists but is dated {stale_date}, not {today_str} — "
+                "ignoring stale file and checking the database instead."
+            )
 
     # --- Source 2: today_games DB table ---
-    print(
-        f"today_games.json not found at {TODAY_GAMES_PATH} — "
-        "loading from today_games database table instead."
-    )
+    print("Loading games from today_games database table.")
     try:
         rows = execute_query(
             "SELECT game_data FROM today_games WHERE game_date = %s ORDER BY id",
@@ -625,7 +632,6 @@ def load_today_games(today_str, conn=None):
         )
         if rows is None:
             raise RuntimeError("execute_query returned None")
-        # psycopg2 deserialises JSONB columns to Python dicts automatically.
         return [row["game_data"] for row in rows]
     except Exception as error:
         raise SystemExit(

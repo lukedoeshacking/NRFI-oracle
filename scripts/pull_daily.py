@@ -279,7 +279,8 @@ def main():
             "hydrate": "probablePitcher",
         },
     )
-
+    for day in schedule_data.get("dates") or []:
+        print("MLB itself says these games are officially for:", day.get("date"))
     # The schedule response nests games under a "dates" list.
     raw_games = []
     for day in schedule_data.get("dates") or []:
